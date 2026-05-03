@@ -123,7 +123,113 @@ Transcript text MAY contain user-fetched external content (web pages, docs, libr
 
 ## §4. Rot Check
 
-[content in Task 5]
+### 4.1 Environment detection
+
+Inspect cwd for ecosystem markers; only invoke tools that the project actually uses. Graceful skip otherwise.
+
+| Marker (cwd) | Test cache paths | Lint tool | Circular dep tool |
+|---|---|---|---|
+| `package.json` | `node_modules/.cache/jest`, `coverage/`, `.vitest-cache/` | `eslint` | `madge` |
+| `pyproject.toml` / `requirements.txt` | `.pytest_cache/lastfailed`, `coverage.xml`, `htmlcov/` | `ruff` | `pydeps` |
+| `Cargo.toml` | `target/test-results/`, `target/debug/deps/` mtime | `clippy` (`cargo clippy`) | (none common) |
+| `go.mod` | `coverage.out`, test cache via `go test -json` artifacts | `go vet` | (none common) |
+| (no marker) | — | — | — |
+
+When no language marker is found, only the marker-free signals run (git, file size, TODO grep, architecture LLM judgment).
+
+### 4.2 Bash collectors (parallel)
+
+Each collector is independent; failure in one does not block others. Skip gracefully and mark the signal as "unavailable".
+
+**Git uncommitted:**
+```bash
+git status --porcelain | wc -l         # file count
+git diff --stat 2>/dev/null | tail -1  # line count summary
+git diff --cached --stat 2>/dev/null | tail -1
+```
+
+**Test cache (artifact mtime — compass does NOT execute tests):**
+```bash
+# Find any standard artifact, take newest mtime
+find .pytest_cache coverage htmlcov coverage.xml node_modules/.cache/jest target/test-results coverage.out 2>/dev/null \
+  -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1
+# If mtime within 600 sec → fresh; else stale; if none found → "no cache"
+```
+
+When cache is fresh, read the artifact to extract pass/fail counts (parser is project-specific: `lastfailed` is JSON, `coverage.xml` is XML, etc.). If parsing fails, treat as "fresh but uncountable" — note in output.
+
+**Lint:**
+```bash
+# Python
+ruff check . --output-format=json 2>/dev/null | uv run python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))" 2>/dev/null
+# Node
+eslint . --format=json 2>/dev/null | uv run python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(f.get('errorCount',0)+f.get('warningCount',0) for f in d))" 2>/dev/null
+# Rust
+cargo clippy --message-format=short 2>&1 | grep -c '^warning\|^error'
+```
+
+Apply 30-second timeout (`timeout 30 ...`). On timeout or non-zero exit, mark "unavailable".
+
+**File bloat:**
+```bash
+find . -type f \( -name '*.py' -o -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.rs' -o -name '*.go' \) \
+  -mtime -14 -not -path './node_modules/*' -not -path './.git/*' -not -path './target/*' \
+  -exec wc -l {} + 2>/dev/null | awk '$1 > 500 && $2 != "total" {print $1, $2}'
+```
+
+**TODO/FIXME grep:**
+```bash
+grep -rE 'TODO|FIXME|XXX' \
+  --include='*.py' --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' --include='*.rs' --include='*.go' \
+  --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=target . 2>/dev/null | wc -l
+```
+
+**Circular dependency (graceful — skip if tool absent):**
+```bash
+# Node: madge --circular --extensions ts,tsx,js,jsx src/ 2>/dev/null | grep -c 'No circular dependency' || madge ... | wc -l
+# Python: pydeps --max-bacon 2 --pylib False --no-show package_name 2>/dev/null
+```
+
+If the tool is not installed (`command -v madge` returns nothing), skip and report "circular dep: unavailable (tool not installed)".
+
+### 4.3 Severity per signal
+
+Apply these thresholds verbatim from the spec. A signal can be SAFE / SUSPICIOUS / CRITICAL / unavailable.
+
+| Signal | SAFE | SUSPICIOUS | CRITICAL |
+|---|---|---|---|
+| Git uncommitted | ≤4 files AND ≤200 lines | 5-9 files OR 200-500 lines | ≥10 files OR ≥500 lines |
+| Test (cache fresh, ≤10 min) | all pass | 1-3 fail | ≥4 fail or compile error |
+| Test (stale or no cache) | "stale" / "no cache" — severity boycotted (skipped from aggregation) | — | — |
+| Lint | ≤5 warnings, 0 errors | 6-20 warnings OR 1-3 errors | ≥21 warnings OR ≥4 errors |
+| File bloat | 0 files >500 lines (recently modified) | 1-2 files >500 | ≥3 files >500 OR 1 file >1000 |
+| TODO grep | ≤10 | 11-30 | ≥31 |
+| Circular dep | 0 | 1-2 | ≥3 |
+| Architecture (LLM) | boundaries clear, patterns consistent | minor violation 1-2 | major violation (layer breach, many unrelated imports, new files ignoring patterns) |
+
+### 4.4 Architecture LLM judgment
+
+Inputs:
+- Top-of-file `import` / `from` / `use` / `require` statements of files modified in the last 14 days.
+- Directory tree to depth 3: `find . -type d -maxdepth 3 -not -path '*/node_modules/*' -not -path '*/.git/*'`.
+
+Single Opus pass judges:
+- **Layer breach** — does a high-level module directly import a low-level concrete (e.g., UI → raw DB driver bypassing service)?
+- **Unrelated-domain imports** — does one file import from many unrelated top-level packages (e.g., a single file pulling auth + payments + analytics + UI)?
+- **Pattern violation** — do recently-added files break the dominant naming/location convention of the directory they sit in?
+
+Output: SAFE / SUSPICIOUS / CRITICAL + one-sentence rationale with file path citation when violation found. If the project lacks any clear layered structure, judge "no layer to violate; pattern check only" and SAFE unless other violations.
+
+### 4.5 Rot axis aggregation rule
+
+After per-signal severity is assigned:
+
+- Any signal CRITICAL → **axis = CRITICAL**.
+- Else any signal SUSPICIOUS → **axis = SUSPICIOUS**. (Single suspicious signal is NOT buried.)
+- Else **axis = SAFE**.
+- `unavailable` / `stale` / `no cache` signals are EXCLUDED from aggregation entirely (they neither contribute to SAFE count nor escalate).
+
+If ALL signals are unavailable → axis = INSUFFICIENT (handled in §5/§8).
 
 ## §5. Synthesizer & Severity
 
