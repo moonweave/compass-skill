@@ -1,5 +1,10 @@
 # /compass — Mid-Session Drift & Rot Audit
 
+> [!IMPORTANT]
+> This standalone skill repo is now a legacy mirror. Active development moved to
+> Decision Kernel:
+> https://github.com/moonweave/decision-kernel/tree/main/skills/compass
+
 A user-invoked Claude Code skill that audits long sessions for two accumulated risks: (1) **drift** between the current task and the original session intent (transcript analysis), and (2) **codebase rot** (git uncommitted accumulation, test/lint state from cached artifacts, file bloat, TODO grep, circular dependencies, module boundary degradation).
 
 Built for the case where you've been working with Claude for hours and want a sanity check — "am I still building what I started?" and "is the codebase getting worse?" — before continuing.
