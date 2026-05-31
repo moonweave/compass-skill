@@ -1,6 +1,8 @@
 ---
 name: compass
 description: User-invoked mid-session audit skill. Detects (1) drift between current task and original session intent via transcript analysis, and (2) codebase rot — git uncommitted accumulation, test/lint state from cached artifacts, file bloat, TODO accumulation, circular dependencies, module boundary degradation. Manually triggered via `/compass` only — never auto-invoked. Use when the user types `/compass` optionally followed by a baseline intent string. Without arguments, derive baseline via cascade — most recent spec (24h), then task-init heuristic, then explicit user prompt. Never use the literal first user message of the transcript as baseline.
+disable-model-invocation: true
+argument-hint: "[baseline intent]"
 ---
 
 # /compass — Mid-Session Drift & Rot Audit
@@ -72,9 +74,12 @@ For each entry, extract `message.content` as text:
 Canonical Bash + Python reader (uv required because raw `python3` is blocked in hook environments):
 
 ```bash
-SESSION_JSONL="${CLAUDE_SESSION_ID:+$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/${CLAUDE_SESSION_ID}.jsonl}"
-[ -z "$SESSION_JSONL" ] || [ ! -f "$SESSION_JSONL" ] && \
-  SESSION_JSONL=$(ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null | head -1)
+PROJECT_ID="$(pwd | sed 's|/|-|g')"
+PROJECT_DIR="$HOME/.claude/projects/$PROJECT_ID"
+SESSION_JSONL="${CLAUDE_SESSION_ID:+$PROJECT_DIR/${CLAUDE_SESSION_ID}.jsonl}"
+if [ -z "$SESSION_JSONL" ] || [ ! -f "$SESSION_JSONL" ]; then
+  SESSION_JSONL=$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
+fi
 
 uv run python3 -c "
 import json, sys
@@ -150,10 +155,26 @@ git diff --cached --stat 2>/dev/null | tail -1
 
 **Test cache (artifact mtime — compass does NOT execute tests):**
 ```bash
-# Find any standard artifact, take newest mtime
-find .pytest_cache coverage htmlcov coverage.xml node_modules/.cache/jest target/test-results coverage.out 2>/dev/null \
-  -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1
-# If mtime within 600 sec → fresh; else stale; if none found → "no cache"
+# Portable macOS/Linux cache mtime collector. Prints epoch + path, or "no cache".
+uv run python3 - <<'PY'
+from pathlib import Path
+paths = [
+    Path('.pytest_cache'), Path('coverage'), Path('htmlcov'), Path('coverage.xml'),
+    Path('node_modules/.cache/jest'), Path('target/test-results'), Path('coverage.out'),
+]
+files = []
+for root in paths:
+    if root.is_file():
+        files.append(root)
+    elif root.is_dir():
+        files.extend(p for p in root.rglob('*') if p.is_file())
+if not files:
+    print('no cache')
+else:
+    newest = max(files, key=lambda p: p.stat().st_mtime)
+    print(f"{newest.stat().st_mtime:.0f} {newest}")
+PY
+# If newest mtime is within 600 sec → fresh; else stale; "no cache" → unverified.
 ```
 
 When cache is fresh, extract pass/fail counts using these parsers:
@@ -197,7 +218,19 @@ eslint . --format=json 2>/dev/null | uv run python3 -c "import json,sys; d=json.
 cargo clippy --message-format=short 2>&1 | grep -c '^warning\|^error'
 ```
 
-Apply 30-second timeout (`timeout 30 ...`). On timeout or non-zero exit, mark "unavailable".
+Apply a 30-second timeout with a portable Python wrapper; macOS does not provide GNU `timeout` by default. Replace `CMD...` with the linter command. On timeout or non-zero exit, mark "unavailable".
+
+```bash
+uv run python3 -c 'import subprocess,sys
+try:
+    r = subprocess.run(sys.argv[1:], text=True, capture_output=True, timeout=30)
+except subprocess.TimeoutExpired:
+    print("unavailable (timeout)")
+    raise SystemExit(124)
+print(r.stdout, end="")
+print(r.stderr, end="", file=sys.stderr)
+raise SystemExit(r.returncode)' CMD...
+```
 
 **File bloat:**
 ```bash
@@ -229,7 +262,7 @@ Apply these thresholds verbatim from the spec. A signal can be SAFE / SUSPICIOUS
 |---|---|---|---|
 | Git uncommitted | ≤4 files AND ≤200 lines | 5-9 files OR 200-500 lines | ≥10 files OR ≥500 lines |
 | Test (cache fresh, ≤10 min) | all pass | 1-3 fail | ≥4 fail or compile error |
-| Test (stale or no cache) | "stale" / "no cache" — severity boycotted (skipped from aggregation) | — | — |
+| Test (stale or no cache) | unverified — skipped from aggregation and reported in `Considered` | — | — |
 | Lint | ≤5 warnings, 0 errors | 6-20 warnings OR 1-3 errors | ≥21 warnings OR ≥4 errors |
 | File bloat | 0 files >500 lines (recently modified) | 1-2 files >500 | ≥3 files >500 OR 1 file >1000 |
 | TODO grep | ≤10 | 11-30 | ≥31 |
@@ -418,7 +451,7 @@ This boundary is the same one applied in `/decide`'s third critical fix (trust b
 | Transcript inaccessible (file not found, permission denied, parse error) | Drift axis = INSUFFICIENT. Output rot only. Note "transcript unreadable" in Considered. |
 | All rot collectors fail (no language marker, git not initialized, no LLM input available) | Rot axis = INSUFFICIENT. Output drift only. |
 | Both fail | Output: `cannot collect signals; check tool availability` and abort. No verdict. |
-| Test cache missing for the project | Test signal = "no cache". Skipped from aggregation, listed in Considered. |
+| Test cache missing for the project | Test signal = "no cache" / unverified. Skipped from aggregation, listed in Considered; do not imply tests are healthy. |
 | Lint tool installed but timeout (>30s) | Lint signal = "unavailable (timeout)". Skipped from aggregation, listed in Considered. |
 | Circular dep tool not installed | Circular dep signal = "unavailable (tool not installed)". Skipped from aggregation, listed in Considered. |
 | Spec referenced by §2 step 2 has no §1/§2 sections | Fall through to §2 step 3. |
